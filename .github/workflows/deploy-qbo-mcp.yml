@@ -1,0 +1,117 @@
+name: Deploy QBO MCP servers
+
+# Builds once, deploys the same artifact to every company's Web App.
+# One workflow with a matrix rather than one file per company — six near
+# identical files is how you end up with five apps on one version and one on
+# another.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      entity:
+        description: "Deploy a single entity (blank = all). One of: construction, brokerage, marketing, propmgmt, solutions"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write   # required for OIDC federated login
+
+env:
+  RESOURCE_GROUP: rg-fs-qbo-mcp
+  APP_PREFIX: fs-qbo-mcp
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      # Fail early and loudly rather than shipping a package without the entry
+      # point. A missing dist/http-server.js deploys fine and then fails as
+      # "no listening ports detected", which is a much worse thing to debug.
+      - name: Verify build output
+        run: test -f dist/http-server.js || { echo "dist/http-server.js missing"; exit 1; }
+
+      # Dependencies are installed here rather than on Azure so the deployed
+      # package is deterministic and identical across all five apps.
+      - run: npm prune --omit=dev
+
+      - run: zip -qr app.zip dist node_modules package.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app
+          path: app.zip
+          retention-days: 7
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      # Sequential on purpose: catch a bad build on Construction before it
+      # reaches all five companies.
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        entity: [construction, brokerage, marketing, propmgmt, solutions]
+    steps:
+      - name: Should this entity run?
+        id: gate
+        run: |
+          SEL="${{ github.event.inputs.entity }}"
+          if [ -n "$SEL" ] && [ "$SEL" != "${{ matrix.entity }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@v4
+        if: steps.gate.outputs.skip == 'false'
+        with:
+          name: app
+
+      - uses: azure/login@v2
+        if: steps.gate.outputs.skip == 'false'
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          az webapp deploy \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "${APP_PREFIX}-${{ matrix.entity }}" \
+            --src-path app.zip \
+            --type zip
+
+      # A deploy that "succeeds" while the container fails to start is the
+      # failure mode this whole stack is prone to. Prove it answers.
+      - name: Wait for the app to answer
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          APP="${APP_PREFIX}-${{ matrix.entity }}"
+          HOST=$(az webapp show -n "$APP" -g "$RESOURCE_GROUP" --query defaultHostName -o tsv)
+          echo "Probing https://$HOST/healthz"
+          for i in $(seq 1 20); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 30 "https://$HOST/healthz" || echo 000)
+            if [ "$CODE" = "200" ]; then echo "healthy after $((i*15))s"; exit 0; fi
+            echo "  attempt $i: HTTP $CODE"
+            sleep 15
+          done
+          echo "::error::$APP never returned 200 from /healthz"
+          echo "Recent container log:"
+          az webapp log deployment show -n "$APP" -g "$RESOURCE_GROUP" || true
+          exit 1
