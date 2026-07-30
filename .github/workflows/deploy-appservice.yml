@@ -1,0 +1,85 @@
+# One dynamic workflow that deploys the Node app to ALL brokerage App Services —
+# replacing the per-app workflows Deployment Center generates (each of which
+# hardcodes a single app-name). Add a brokerage by editing the APP list in the
+# `setup` job (or the APP_SERVICES repo variable), not by wiring another
+# Deployment Center connection.
+#
+# Triggers:
+#   - push to main       -> build once, deploy to every app in the list
+#   - manual (dispatch)  -> optionally target ONE app via the `app` input
+#
+# Per-company config (client id/secret, MCP_AUTH_TOKEN, refresh token, realm,
+# Key Vault URL) lives in each App Service's app settings — never in this repo.
+
+name: Deploy to App Services
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      app:
+        description: 'Deploy to a single App Service (blank = all of them)'
+        required: false
+        default: ''
+
+permissions:
+  id-token: write   # azure/login OIDC
+  contents: read
+
+jobs:
+  # Builds the dynamic matrix: the single app from the manual input, else the
+  # full list. Swap the fallback for `fromJSON(vars.APP_SERVICES)` to manage the
+  # list as a GitHub repo variable (no code change to add a brokerage).
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.list.outputs.apps }}
+    steps:
+      - id: list
+        run: |
+          if [ -n "${{ github.event.inputs.app }}" ]; then
+            echo "apps=[\"${{ github.event.inputs.app }}\"]" >> "$GITHUB_OUTPUT"
+          else
+            echo 'apps=["fs-qbo-mcp-brokerage","fs-qbo-mcp-construction","fs-qbo-mcp-marketing","fs-qbo-mcp-propmgmt","fs-qbo-mcp-solutions"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+      - name: Install, build, test
+        run: |
+          npm ci
+          npm run build
+          npm test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app
+          path: .
+
+  deploy:
+    needs: [ setup, build ]
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1               # one brokerage at a time; remove for all at once
+      matrix:
+        app: ${{ fromJSON(needs.setup.outputs.apps) }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: app
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Deploy to ${{ matrix.app }}
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ matrix.app }}
+          package: .
