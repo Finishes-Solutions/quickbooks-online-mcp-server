@@ -104,6 +104,73 @@ Set any of the `DISABLE_*` flags to `"true"` to prevent that category of tools f
 
 ---
 
+## Remote / HTTP deployment
+
+In addition to the default **stdio** transport (used by Claude Code, Cursor, etc.), the server can run as a remote **Streamable HTTP** service — required for clients that call it over the network, such as a Microsoft Copilot Studio agent. Both transports register the identical tool set; they are just two entry points into the same server.
+
+### Entry points
+
+| Command | Transport | Use case |
+|---------|-----------|----------|
+| `npm start` (`dist/index.js`) | stdio | Local MCP hosts (Claude Code, Cursor) |
+| `npm run start:http` (`dist/http-server.js`) | Streamable HTTP | Remote hosting (Azure Container Apps, etc.) |
+
+The HTTP server runs **stateless** (a fresh server per request), exposes the MCP endpoint at `POST /mcp`, and serves an unauthenticated `GET /healthz` liveness probe.
+
+### HTTP-specific environment variables
+
+| Variable | Required | Description |
+|----------|:--------:|-------------|
+| `MCP_AUTH_TOKEN` | ✅ | Bearer token every `/mcp` request must present (`Authorization: Bearer <token>`). The server refuses to start without it. Use a distinct value per deployment. |
+| `PORT` | – | Listen port (default `3000`; Azure Container Apps sets this automatically). |
+
+```bash
+# Run the HTTP server locally (read-only)
+MCP_AUTH_TOKEN=choose-a-strong-token \
+QUICKBOOKS_DISABLE_WRITE=true \
+QUICKBOOKS_DISABLE_UPDATE=true \
+QUICKBOOKS_DISABLE_DELETE=true \
+npm run start:http
+
+# Smoke test
+curl -s http://localhost:3000/healthz
+curl -s -X POST http://localhost:3000/mcp \
+  -H "Authorization: Bearer choose-a-strong-token" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+### Token persistence (Azure Key Vault)
+
+Intuit rotates the refresh token roughly daily; the server persists each rotated token so refresh keeps working. By default it writes to the local `.env`, which is **ephemeral on container hosts** — a restart would lose the rotated token. For cloud deployments, point the server at **Azure Key Vault** instead:
+
+| Variable | Required | Description |
+|----------|:--------:|-------------|
+| `QUICKBOOKS_KEYVAULT_URL` | – | Key Vault URL (e.g. `https://my-vault.vault.azure.net/`). When set, tokens are read at startup from and written on rotation to Key Vault instead of `.env`. |
+| `QUICKBOOKS_KEYVAULT_REFRESH_TOKEN_SECRET` | – | Secret name for the refresh token (default `quickbooks-refresh-token`). |
+| `QUICKBOOKS_KEYVAULT_REALM_ID_SECRET` | – | Secret name for the realm id (default `quickbooks-realm-id`). |
+
+Authentication to Key Vault uses `DefaultAzureCredential` — a managed identity in Azure (Container Apps / App Service), or `az login` / environment credentials locally. Grant the identity **get** and **set** secret permissions.
+
+**Bootstrap (per company):** complete the one-time `npm run auth` handshake to obtain a refresh token, seed the two Key Vault secrets with the resulting refresh token and realm id, then deploy with `QUICKBOOKS_KEYVAULT_URL` set. Overridable secret names let multiple companies share a single vault.
+
+### Docker
+
+A multi-stage `Dockerfile` builds a production image that starts the HTTP server:
+
+```bash
+docker build -t qbo-mcp-server .
+docker run -p 3000:3000 \
+  -e MCP_AUTH_TOKEN=choose-a-strong-token \
+  -e QUICKBOOKS_CLIENT_ID=... -e QUICKBOOKS_CLIENT_SECRET=... \
+  -e QUICKBOOKS_REFRESH_TOKEN=... -e QUICKBOOKS_REALM_ID=... \
+  -e QUICKBOOKS_ENVIRONMENT=sandbox \
+  qbo-mcp-server
+```
+
+---
+
 ## Available Tools
 
 ### Entities
