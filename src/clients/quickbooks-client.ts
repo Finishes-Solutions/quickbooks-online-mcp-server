@@ -2,10 +2,10 @@ import dotenv from "dotenv";
 import QuickBooks from "node-quickbooks";
 import OAuthClient from "intuit-oauth";
 import http from 'http';
-import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import open from 'open';
+import { createTokenStore, TokenStore } from './token-store.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -58,6 +58,13 @@ export class QuickbooksClient {
   private oauthClient: OAuthClient;
   private isAuthenticating: boolean = false;
   private redirectUri: string;
+
+  // Durable persistence for the rotating refresh token / realm id. Defaults to
+  // the local .env; swapped for Azure Key Vault when QUICKBOOKS_KEYVAULT_URL is
+  // set (see token-store.ts).
+  private readonly tokenStore: TokenStore = createTokenStore();
+  // Ensures we pull persisted tokens from the store at most once per process.
+  private loaded = false;
 
   // Refresh 5 minutes before actual expiry to avoid edge cases
   private static readonly TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
@@ -159,7 +166,7 @@ export class QuickbooksClient {
             // Save tokens
             this.refreshToken = tokens.refresh_token;
             this.realmId = tokens.realmId;
-            this.saveTokensToEnv();
+            await this.persistTokens();
 
             // Send success response
             res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -247,74 +254,31 @@ export class QuickbooksClient {
     });
   }
 
-  private saveTokensToEnv(): void {
-    const tokenPath = path.join(__dirname, '..', '..', '.env');
-    const envContent = fs.existsSync(tokenPath) ? fs.readFileSync(tokenPath, 'utf-8') : '';
-    const envLines = envContent.split('\n');
-
-    const updateEnvVar = (name: string, value: string) => {
-      const index = envLines.findIndex(line => line.startsWith(`${name}=`));
-      if (index !== -1) {
-        envLines[index] = `${name}=${value}`;
-      } else {
-        envLines.push(`${name}=${value}`);
-      }
-    };
-
-    if (this.refreshToken) updateEnvVar('QUICKBOOKS_REFRESH_TOKEN', this.refreshToken);
-    if (this.realmId) updateEnvVar('QUICKBOOKS_REALM_ID', this.realmId);
-
-    const newContent = envLines.join('\n');
-    const isSymlink = this.isSymbolicLink(tokenPath);
-
-    if (isSymlink) {
-      // Write directly through the symlink to the real target. Using
-      // rename on a symlink replaces the link itself rather than writing
-      // through it, which breaks persistent-volume mounts in containers.
-      // If the symlink target doesn't exist yet (fresh PVC mount), resolve
-      // the link target without requiring it to exist, then write directly.
-      let realPath: string;
-      try {
-        realPath = fs.realpathSync(tokenPath);
-      } catch (e: any) {
-        if (e?.code === 'ENOENT') {
-          // Dangling symlink: target doesn't exist yet. readlinkSync returns the
-          // link target as stored, which may be RELATIVE — and a relative path is
-          // resolved against the process cwd, not the link's own directory. Resolve
-          // it against the symlink's directory so we write to the intended location.
-          const linkTarget = fs.readlinkSync(tokenPath);
-          realPath = path.isAbsolute(linkTarget)
-            ? linkTarget
-            : path.resolve(path.dirname(tokenPath), linkTarget);
-        } else {
-          throw e;
-        }
-      }
-      // Deliberate: no temp-file+rename here. Renaming over a symlink replaces the
-      // link itself (the bug this branch fixes), so we write through to the target
-      // directly. This trades atomicity for correct persistent-volume behavior — a
-      // crash mid-write could leave the target .env partially written.
-      fs.writeFileSync(realPath, newContent, { mode: 0o600 });
-    } else {
-      // Atomic write: write to a sibling temp file, then rename. On POSIX
-      // rename is atomic within the same filesystem, so a crash mid-write
-      // cannot leave .env half-written or empty.
-      const tmpPath = `${tokenPath}.tmp.${process.pid}`;
-      try {
-        fs.writeFileSync(tmpPath, newContent, { mode: 0o600 });
-        fs.renameSync(tmpPath, tokenPath);
-      } catch (err) {
-        try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
-        throw err;
-      }
-    }
+  // Persist the current refresh token / realm id via the configured token store
+  // (.env locally, Azure Key Vault in the cloud). Async because remote stores
+  // require a network round-trip.
+  private async persistTokens(): Promise<void> {
+    await this.tokenStore.save({
+      refreshToken: this.refreshToken,
+      realmId: this.realmId,
+    });
   }
 
-  private isSymbolicLink(filePath: string): boolean {
+  // Hydrate in-memory credentials from the token store once per process. In env
+  // mode this is a no-op (dotenv already populated the constructor values); in
+  // Key Vault mode it pulls the latest rotated token, which may be newer than
+  // whatever was injected via environment variables.
+  private async ensureLoaded(): Promise<void> {
+    if (this.loaded) return;
+    this.loaded = true;
     try {
-      return fs.lstatSync(filePath).isSymbolicLink();
-    } catch {
-      return false;
+      const persisted = await this.tokenStore.load();
+      if (persisted.refreshToken) this.refreshToken = persisted.refreshToken;
+      if (persisted.realmId) this.realmId = persisted.realmId;
+    } catch (err) {
+      // A store read failure shouldn't hard-fail startup — fall back to whatever
+      // credentials were provided via the environment.
+      console.error('[qbo-client] Failed to load tokens from store:', err);
     }
   }
 
@@ -359,11 +323,11 @@ export class QuickbooksClient {
         if (newRefreshToken && newRefreshToken !== this.refreshToken) {
           this.refreshToken = newRefreshToken;
           try {
-            this.saveTokensToEnv();
-            console.error('[qbo-client] Refresh token rotated and persisted to .env');
+            await this.persistTokens();
+            console.error('[qbo-client] Refresh token rotated and persisted to token store');
           } catch (persistErr) {
-            // Don't fail the whole refresh just because we couldn't write to
-            // disk; the in-memory token is still valid for this process.
+            // Don't fail the whole refresh just because we couldn't persist; the
+            // in-memory token is still valid for this process.
             console.error('[qbo-client] Failed to persist rotated refresh token:', persistErr);
           }
         }
@@ -398,6 +362,10 @@ export class QuickbooksClient {
 
     this.authInFlight = (async () => {
       try {
+        // Pull any persisted (possibly rotated) tokens before deciding whether
+        // we still need the interactive OAuth flow.
+        await this.ensureLoaded();
+
         if (!this.refreshToken || !this.realmId) {
           await this.startOAuthFlow();
 

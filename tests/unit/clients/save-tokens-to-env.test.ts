@@ -86,6 +86,7 @@ jest.unstable_mockModule('http', () => ({
 }));
 
 const { quickbooksClient } = await import('../../../src/clients/quickbooks-client');
+const { EnvFileTokenStore } = await import('../../../src/clients/token-store');
 
 describe('saveTokensToEnv (via authenticate)', () => {
   beforeEach(() => {
@@ -185,5 +186,36 @@ describe('saveTokensToEnv (via authenticate)', () => {
     // authenticate() catches saveTokensToEnv errors (line 336-338 in source)
     // and logs them; it should NOT throw.
     await expect(quickbooksClient.authenticate()).resolves.not.toThrow();
+  });
+
+  it('cleans up the temp file (best-effort) and rethrows when atomic rename fails', async () => {
+    lstatBehavior = 'regular';
+    // Regular-file path: writeFileSync(tmp) succeeds, renameSync throws.
+    renameSyncSpy.mockImplementationOnce(() => {
+      throw new Error('rename failed');
+    });
+    // The best-effort unlink cleanup also throws and must be swallowed, leaving
+    // the original rename error to propagate out of the store's save().
+    unlinkSyncSpy.mockImplementationOnce(() => {
+      throw new Error('unlink failed');
+    });
+
+    // persistTokens() errors are caught and logged inside refreshAccessToken(),
+    // so authenticate() still resolves.
+    await expect(quickbooksClient.authenticate()).resolves.not.toThrow();
+    expect(unlinkSyncSpy).toHaveBeenCalled();
+  });
+
+  it('writes without updating either var when no tokens are provided', async () => {
+    writeFileSyncSpy.mockClear();
+    renameSyncSpy.mockClear();
+    lstatBehavior = 'regular';
+
+    // Both `if (tokens.refreshToken)` and `if (tokens.realmId)` guards take the
+    // false branch; the existing file content is written back unchanged.
+    await new EnvFileTokenStore().save({});
+
+    expect(writeFileSyncSpy).toHaveBeenCalled();
+    expect(renameSyncSpy).toHaveBeenCalled();
   });
 });
