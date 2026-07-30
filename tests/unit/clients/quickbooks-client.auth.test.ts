@@ -99,7 +99,7 @@ jest.unstable_mockModule('fs', () => ({
   },
 }));
 
-const { quickbooksClient } = await import('../../../src/clients/quickbooks-client');
+const { quickbooksClient, QuickbooksClient } = await import('../../../src/clients/quickbooks-client');
 
 // Polls until the OAuth callback handler has been registered by startOAuthFlow.
 async function untilCallbackRegistered(timeoutMs = 2000): Promise<void> {
@@ -164,4 +164,30 @@ describe('QuickbooksClient.authenticate', () => {
     expect(refreshDispatch).toHaveBeenLastCalledWith('flow-refresh-token');
     expect(res.writeHead).toHaveBeenCalledWith(200, { 'Content-Type': 'text/html' });
   }, 15000);
+});
+
+describe('QuickbooksClient accessors (handler entry points)', () => {
+  it('getInstance() authenticates and returns the QuickBooks instance', async () => {
+    refreshDispatch.mockResolvedValue({
+      token: { access_token: 'access-getinstance', expires_in: 3600, refresh_token: 'rotated-getinstance' },
+    });
+    // Force the freshness check to trigger a refresh + rebuild.
+    (quickbooksClient as unknown as { accessTokenExpiry?: Date }).accessTokenExpiry = new Date(0);
+    (quickbooksClient as unknown as { authInFlight?: unknown }).authInFlight = undefined;
+
+    const qb = await QuickbooksClient.getInstance();
+    expect(qb).toBeDefined();
+  });
+
+  it('getAuthCredentials() returns the access token, realm id, and sandbox flag', async () => {
+    // Uses the fresh access token established by the previous test.
+    const creds = await QuickbooksClient.getAuthCredentials();
+    expect(typeof creds.accessToken).toBe('string');
+    expect(creds.realmId).toBe('12345');
+    expect(creds.isSandbox).toBe(true);
+  });
+
+  it('getQuickbooks() returns the current instance once authenticated', () => {
+    expect(quickbooksClient.getQuickbooks()).toBeDefined();
+  });
 });
