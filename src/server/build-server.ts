@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { RegisterTool } from "../helpers/register-tool.js";
 
+import { GetReportPayloadTool } from "../tools/get-report-payload.tool.js";
 import { CreateInvoiceTool } from "../tools/create-invoice.tool.js";
 import { ReadInvoiceTool } from "../tools/read-invoice.tool.js";
 import { SearchInvoicesTool } from "../tools/search-invoices.tool.js";
@@ -426,6 +427,9 @@ export function buildServer(): McpServer {
   RegisterTool(server, GetAgedPayablesTool);
   RegisterTool(server, GetVendorExpensesTool);
   RegisterTool(server, GetVendorBalanceTool);
+
+  // Pre-shaped report payload for automated PDF and Excel generation
+  RegisterTool(server, GetReportPayloadTool);
 
   return server;
 }
