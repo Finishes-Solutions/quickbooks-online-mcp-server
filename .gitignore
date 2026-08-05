@@ -4,6 +4,9 @@ node_modules
 dist
 coverage
 
+# Deploy artifact built by .github/workflows/deploy-appservice.yml
+app.zip
+
 .env
 .env.local
 .env.*.local
