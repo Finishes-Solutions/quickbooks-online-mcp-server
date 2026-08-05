@@ -43,6 +43,7 @@ on:
       - 'infra/**'                       # Bicep + deploy script for the Container Apps stack
       - 'scripts/**'                     # local balance-sheet capture scripts, not shipped
       - '.github/workflows/claude*.yml'  # Claude review / mention workflows
+      - '.github/workflows/configure-appsettings.yml'  # one-shot Azure admin workflow
   workflow_dispatch:
     inputs:
       app:
