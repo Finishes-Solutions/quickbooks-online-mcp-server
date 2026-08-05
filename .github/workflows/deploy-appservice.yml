@@ -126,7 +126,12 @@ jobs:
     needs: [ setup, build ]
     runs-on: ubuntu-latest
     strategy:
-      max-parallel: 5               # one brokerage at a time; raise to 5 after two clean runs
+      # The apps are independent and share a single pre-built artifact, so one
+      # app failing says nothing about the other four. Without this, GitHub
+      # cancels the rest on the first failure — which is how a single slow app
+      # left three brokerages stranded on an older build.
+      fail-fast: false
+      max-parallel: 5
       matrix:
         app: ${{ fromJSON(needs.setup.outputs.apps) }}
     steps:
@@ -149,12 +154,28 @@ jobs:
 
       # A deploy that "succeeds" while the container never starts should fail the
       # job. Poll /healthz (unauthenticated by design) until it returns 200.
+      # Budget, not attempt count. A restart of a warm site answers in well under
+      # a minute, but a cold start of a *stopped* site is far slower: Azure has
+      # to establish networking, pull the runtime image, mount volumes, then read
+      # 20k files out of the mounted package before the app can listen. One
+      # observed cold start took 15 minutes end to end and Azure's own startup
+      # probe succeeded at 735s. A 10-minute ceiling failed that job while the
+      # app was still legitimately starting, so allow headroom comparable to
+      # WEBSITES_CONTAINER_START_TIME_LIMIT (1800s) rather than calling it dead.
       - name: Health probe
         run: |
           url="https://${{ matrix.app }}.azurewebsites.net/healthz"
-          for i in $(seq 1 30); do
+          deadline=$(( SECONDS + 1500 ))
+          attempt=0
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            attempt=$(( attempt + 1 ))
             code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$url" || true)
-            if [ "$code" = "200" ]; then echo "$url -> 200 (healthy)"; exit 0; fi
-            echo "attempt $i/30: $code"; sleep 10
+            if [ "$code" = "200" ]; then
+              echo "$url -> 200 (healthy after ${SECONDS}s, ${attempt} attempts)"
+              exit 0
+            fi
+            echo "attempt ${attempt}: ${code} (${SECONDS}s elapsed)"
+            sleep 15
           done
-          echo "::error::$url never returned 200"; exit 1
+          echo "::error::$url never returned 200 within ${SECONDS}s"
+          exit 1
