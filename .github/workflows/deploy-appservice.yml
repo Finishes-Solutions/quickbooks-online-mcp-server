@@ -126,7 +126,7 @@ jobs:
     needs: [ setup, build ]
     runs-on: ubuntu-latest
     strategy:
-      max-parallel: 1               # one brokerage at a time; raise to 5 after two clean runs
+      max-parallel: 5               # one brokerage at a time; raise to 5 after two clean runs
       matrix:
         app: ${{ fromJSON(needs.setup.outputs.apps) }}
     steps:
