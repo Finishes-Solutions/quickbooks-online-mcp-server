@@ -1,0 +1,128 @@
+# One-shot administrative workflow: applies the run-from-package app settings to
+# the App Services, using the same OIDC identity that already deploys them.
+#
+# Why this exists: the settings below are ordinarily set once with `az` from a
+# workstation or Cloud Shell. If the interactive account lacks
+# Microsoft.Web/sites/config/* on the resource group (a read-only service
+# account, say), that route is blocked — but the GitHub OIDC principal that
+# performs deploys generally holds Website Contributor and can do it.
+#
+# Manual dispatch only. This never runs on a push. Setting app settings restarts
+# the app, so run it deliberately, not on every deploy.
+
+name: Configure App Settings (one-shot)
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: 'Configure a single App Service (blank = all of them)'
+        required: false
+        default: ''
+      resource_group:
+        description: 'Resource group holding the App Services'
+        required: false
+        default: 'rg-fs-qbo-mcp'
+      set_startup_command:
+        description: 'Also set the startup command to node dist/http-server.js'
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write   # azure/login OIDC
+  contents: read
+
+jobs:
+  configure:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Fail early and legibly if the OIDC principal cannot even see the apps —
+      # that distinguishes "wrong subscription" from "insufficient role".
+      - name: Show context and confirm the apps are visible
+        env:
+          RG: ${{ inputs.resource_group }}
+        run: |
+          az account show --query "{subscription:name, id:id, tenant:tenantId}" -o table
+          echo "Apps visible in $RG:"
+          az webapp list -g "$RG" --query "[].{name:name, state:state}" -o table
+
+      - name: Apply settings
+        env:
+          RG: ${{ inputs.resource_group }}
+          ONE_APP: ${{ inputs.app }}
+          SET_STARTUP: ${{ inputs.set_startup_command }}
+        run: |
+          if [ -n "$ONE_APP" ]; then
+            APPS="$ONE_APP"
+          else
+            APPS="fs-qbo-mcp-brokerage fs-qbo-mcp-construction fs-qbo-mcp-marketing fs-qbo-mcp-propmgmt fs-qbo-mcp-solutions"
+          fi
+
+          failed=0
+          for APP in $APPS; do
+            echo "::group::$APP"
+
+            # WEBSITES_CONTAINER_START_TIME_LIMIT is a safety net for the first
+            # run in case anything still extracts. Harmless to leave in place,
+            # but it does mask a genuinely slow start — drop it once deploys are
+            # reliably fast.
+            if az webapp config appsettings set -g "$RG" -n "$APP" --settings \
+                 WEBSITE_RUN_FROM_PACKAGE=1 \
+                 SCM_DO_BUILD_DURING_DEPLOYMENT=false \
+                 ENABLE_ORYX_BUILD=false \
+                 WEBSITES_CONTAINER_START_TIME_LIMIT=1800 -o none; then
+              echo "settings applied"
+            else
+              echo "::error::$APP — failed to set app settings"
+              failed=1
+              echo "::endgroup::"
+              continue
+            fi
+
+            # `npm start` runs dist/index.js, the stdio server, which never opens
+            # a port. The HTTP entry point is dist/http-server.js. A wrong
+            # startup command yields the same "no listening ports" symptom as a
+            # bad package, so pin it explicitly.
+            if [ "$SET_STARTUP" = "true" ]; then
+              if az webapp config set -g "$RG" -n "$APP" \
+                   --startup-file "node dist/http-server.js" -o none; then
+                echo "startup command set"
+              else
+                echo "::error::$APP — failed to set startup command"
+                failed=1
+              fi
+            fi
+
+            echo "::endgroup::"
+          done
+
+          [ "$failed" -eq 0 ] || { echo "::error::One or more apps failed to configure"; exit 1; }
+
+      # Read back what actually landed, rather than trusting the writes above.
+      - name: Verify
+        if: always()
+        env:
+          RG: ${{ inputs.resource_group }}
+          ONE_APP: ${{ inputs.app }}
+        run: |
+          if [ -n "$ONE_APP" ]; then
+            APPS="$ONE_APP"
+          else
+            APPS="fs-qbo-mcp-brokerage fs-qbo-mcp-construction fs-qbo-mcp-marketing fs-qbo-mcp-propmgmt fs-qbo-mcp-solutions"
+          fi
+
+          for APP in $APPS; do
+            echo "== $APP"
+            az webapp config appsettings list -g "$RG" -n "$APP" \
+              --query "[?name=='WEBSITE_RUN_FROM_PACKAGE'||name=='ENABLE_ORYX_BUILD'||name=='SCM_DO_BUILD_DURING_DEPLOYMENT'||name=='WEBSITES_CONTAINER_START_TIME_LIMIT'].{name:name,value:value}" \
+              -o table || echo "  (could not read settings)"
+            printf "  startup: "
+            az webapp config show -g "$RG" -n "$APP" --query "appCommandLine" -o tsv || true
+          done
