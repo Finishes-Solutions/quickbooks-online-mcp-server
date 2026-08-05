@@ -4,6 +4,12 @@
 # `setup` job (or the APP_SERVICES repo variable), not by wiring another
 # Deployment Center connection.
 #
+# Packaging: the build job produces a lean `app.zip` (dist + production
+# node_modules + manifests, ~20 MB) instead of uploading the whole working
+# directory (~240 MB with dev deps, .git and src). Combined with
+# WEBSITE_RUN_FROM_PACKAGE=1 on each app there is no server-side Oryx rebuild —
+# the app mounts a known-good, prebuilt zip read-only.
+#
 # Triggers:
 #   - push to main       -> build once, deploy to every app in the list
 #   - manual (dispatch)  -> optionally target ONE app via the `app` input
@@ -14,8 +20,29 @@
 name: Deploy to App Services
 
 on:
+  # Path-filtered: a push touching only docs, infra, or the Docker/Container
+  # Apps path cannot change one byte of app.zip (dist + prod node_modules +
+  # manifests), so it does not deploy. Anything NOT listed here still deploys —
+  # the filter fails open on purpose, so an unanticipated file gets an
+  # unnecessary ~2-minute run rather than a silent no-deploy you have to debug.
+  #
+  # `tests/**`, `jest.config.js` and `tsconfig.test.json` are deliberately absent
+  # from this list. They never enter the zip, but this is the only workflow in
+  # the repo that runs `npm test`, so ignoring them would mean a test-only change
+  # never runs the suite anywhere.
   push:
     branches: [ main ]
+    paths-ignore:
+      - '**.md'                          # README, CHANGELOG, CONTRIBUTING, docs/*.md, infra/README.md
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.env.example'
+      - 'Dockerfile'                     # Container Apps image — never enters the App Service zip
+      - '.dockerignore'                  #   ""
+      - 'infra/**'                       # Bicep + deploy script for the Container Apps stack
+      - 'scripts/**'                     # local balance-sheet capture scripts, not shipped
+      - '.github/workflows/claude*.yml'  # Claude review / mention workflows
   workflow_dispatch:
     inputs:
       app:
@@ -26,6 +53,12 @@ on:
 permissions:
   id-token: write   # azure/login OIDC
   contents: read
+
+# Queue overlapping runs instead of letting two deploys race and overwrite each
+# other. cancel-in-progress:false = a second run waits, it does not kill the first.
+concurrency:
+  group: deploy-appservice-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   # Builds the dynamic matrix: the single app from the manual input, else the
@@ -51,35 +84,76 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22.x'
-      - name: Install, build, test
+          cache: npm
+
+      # Full install (incl. dev deps) so tsc and jest are available.
+      # --ignore-scripts skips the `prepare` hook (we build explicitly below) and
+      # any dependency install hooks, mirroring the Dockerfile.
+      - name: Install & build
         run: |
-          npm ci
+          npm ci --ignore-scripts
           npm run build
-          npm test
+
+      # Real protection — 33 suites / 618 tests, cheap. Runs before dev deps go.
+      - name: Test
+        run: npm test
+
+      # Fail here, loudly, in CI — rather than as a mystery "no listening ports"
+      # after a deploy that reported success.
+      - name: Verify build output
+        run: |
+          test -f dist/http-server.js || { echo "::error::dist/http-server.js missing after build"; exit 1; }
+
+      # Reinstall production dependencies only. Wipes and repopulates
+      # node_modules (~238 MB -> ~125 MB); leaves dist/ untouched.
+      - name: Prune to production dependencies
+        run: npm ci --omit=dev --ignore-scripts
+
+      # Lean deploy artifact: runtime code + prod deps + manifests. No src, no
+      # .git, no dev deps.
+      - name: Package app.zip
+        run: |
+          zip -r -q app.zip dist node_modules package.json package-lock.json
+          ls -lh app.zip
+
       - uses: actions/upload-artifact@v4
         with:
           name: app
-          path: .
+          path: app.zip
 
   deploy:
     needs: [ setup, build ]
     runs-on: ubuntu-latest
     strategy:
-      max-parallel: 1               # one brokerage at a time; remove for all at once
+      max-parallel: 1               # one brokerage at a time; raise to 5 after two clean runs
       matrix:
         app: ${{ fromJSON(needs.setup.outputs.apps) }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: app
+
       - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
       - name: Deploy to ${{ matrix.app }}
         uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ matrix.app }}
-          package: .
+          package: app.zip
+
+      # A deploy that "succeeds" while the container never starts should fail the
+      # job. Poll /healthz (unauthenticated by design) until it returns 200.
+      - name: Health probe
+        run: |
+          url="https://${{ matrix.app }}.azurewebsites.net/healthz"
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$url" || true)
+            if [ "$code" = "200" ]; then echo "$url -> 200 (healthy)"; exit 0; fi
+            echo "attempt $i/30: $code"; sleep 10
+          done
+          echo "::error::$url never returned 200"; exit 1
